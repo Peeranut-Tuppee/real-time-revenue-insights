@@ -1,0 +1,415 @@
+# Dockerfile
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements file
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create logs directory
+RUN mkdir -p logs
+
+# Expose ports
+EXPOSE 5000 8501
+
+# Default command
+CMD ["python", "pipeline.py"]
+
+#---
+# requirements.txt
+#---
+psycopg2-binary==2.9.7
+kafka-python==2.0.2
+streamlit==1.28.1
+pandas==2.1.1
+numpy==1.24.3
+requests==2.31.0
+schedule==1.2.0
+plotly==5.17.0
+flask==2.3.3
+redis==4.6.0
+
+#---
+# init.sql
+#---
+-- PostgreSQL initialization script
+CREATE DATABASE IF NOT EXISTS transaction_db;
+
+-- Connect to the database
+\c transaction_db;
+
+-- Create extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Create transactions table
+CREATE TABLE IF NOT EXISTS transactions (
+    id SERIAL PRIMARY KEY,
+    transaction_id VARCHAR(50) UNIQUE NOT NULL,
+    amount DECIMAL(15, 2) NOT NULL,
+    currency VARCHAR(3) NOT NULL,
+    amount_usd DECIMAL(15, 2),
+    country VARCHAR(50) NOT NULL,
+    user_id VARCHAR(50) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create FX rates table
+CREATE TABLE IF NOT EXISTS fx_rates (
+    id SERIAL PRIMARY KEY,
+    currency VARCHAR(3) NOT NULL,
+    rate_to_usd DECIMAL(10, 6) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create processed transactions table
+CREATE TABLE IF NOT EXISTS processed_transactions (
+    id SERIAL PRIMARY KEY,
+    transaction_id VARCHAR(50) UNIQUE NOT NULL,
+    amount DECIMAL(15, 2) NOT NULL,
+    currency VARCHAR(3) NOT NULL,
+    amount_usd DECIMAL(15, 2) NOT NULL,
+    country VARCHAR(50) NOT NULL,
+    user_id VARCHAR(50) NOT NULL,
+    fx_rate DECIMAL(10, 6) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create indexes for better performance
+CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_transactions_country ON transactions(country);
+CREATE INDEX IF NOT EXISTS idx_transactions_currency ON transactions(currency);
+CREATE INDEX IF NOT EXISTS idx_processed_transactions_timestamp ON processed_transactions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_processed_transactions_country ON processed_transactions(country);
+CREATE INDEX IF NOT EXISTS idx_processed_transactions_user ON processed_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_fx_rates_currency_timestamp ON fx_rates(currency, timestamp);
+
+-- Insert sample FX rates
+INSERT INTO fx_rates (currency, rate_to_usd, timestamp) VALUES
+('EUR', 0.85, NOW()),
+('GBP', 0.75, NOW()),
+('JPY', 110.0, NOW()),
+('THB', 35.0, NOW()),
+('SGD', 1.35, NOW()),
+('AUD', 1.45, NOW()),
+('CAD', 1.25, NOW())
+ON CONFLICT DO NOTHING;
+
+#---
+# api_server.py (Separated API Server)
+#---
+from flask import Flask, jsonify, request
+import psycopg2
+import os
+from datetime import datetime, timedelta
+import json
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for dashboard
+
+# Database Configuration
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'database': os.getenv('DB_NAME', 'transaction_db'),
+    'user': os.getenv('DB_USER', 'postgres'),
+    'password': os.getenv('DB_PASSWORD', 'password'),
+    'port': os.getenv('DB_PORT', '5432')
+}
+
+def get_db_connection():
+    """Get database connection"""
+    return psycopg2.connect(**DB_CONFIG)
+
+@app.route('/api/health')
+def health_check():
+    """Health check endpoint"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.close()
+        conn.close()
+        return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+    except Exception as e:
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
+
+@app.route('/api/revenue/24h')
+def get_24h_revenue():
+    """Get total revenue in last 24 hours"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COALESCE(SUM(amount_usd), 0) as total_revenue,
+                   COUNT(*) as transaction_count
+            FROM processed_transactions
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'
+        """)
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'total_revenue_usd': float(result[0]),
+            'transaction_count': result[1],
+            'period': '24_hours',
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/revenue/by_country')
+def get_revenue_by_country():
+    """Get revenue breakdown by country"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT country, 
+                   COALESCE(SUM(amount_usd), 0) as revenue,
+                   COUNT(*) as transaction_count
+            FROM processed_transactions
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'
+            GROUP BY country
+            ORDER BY revenue DESC
+        """)
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return jsonify([{
+            'country': row[0],
+            'revenue_usd': float(row[1]),
+            'transaction_count': row[2]
+        } for row in results])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/revenue/by_currency')
+def get_revenue_by_currency():
+    """Get revenue breakdown by currency"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT currency, 
+                   COALESCE(SUM(amount_usd), 0) as revenue_usd,
+                   COALESCE(SUM(amount), 0) as revenue_original,
+                   COUNT(*) as transaction_count
+            FROM processed_transactions
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'
+            GROUP BY currency
+            ORDER BY revenue_usd DESC
+        """)
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return jsonify([{
+            'currency': row[0],
+            'revenue_usd': float(row[1]),
+            'revenue_original': float(row[2]),
+            'transaction_count': row[3]
+        } for row in results])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/transactions/hourly')
+def get_hourly_transactions():
+    """Get hourly transaction activity"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 
+                DATE_TRUNC('hour', timestamp) as hour,
+                COUNT(*) as transaction_count,
+                COALESCE(SUM(amount_usd), 0) as revenue_usd,
+                COALESCE(AVG(amount_usd), 0) as avg_transaction_usd
+            FROM processed_transactions
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'
+            GROUP BY hour
+            ORDER BY hour
+        """)
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return jsonify([{
+            'hour': row[0].isoformat(),
+            'transaction_count': row[1],
+            'revenue_usd': float(row[2]),
+            'avg_transaction_usd': float(row[3])
+        } for row in results])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/users/top')
+def get_top_users():
+    """Get top users by revenue"""
+    limit = request.args.get('limit', 10, type=int)
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT user_id, 
+                   COALESCE(SUM(amount_usd), 0) as revenue_usd,
+                   COUNT(*) as transaction_count,
+                   COALESCE(AVG(amount_usd), 0) as avg_transaction_usd
+            FROM processed_transactions
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'
+            GROUP BY user_id
+            ORDER BY revenue_usd DESC
+            LIMIT %s
+        """, (limit,))
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return jsonify([{
+            'user_id': row[0],
+            'revenue_usd': float(row[1]),
+            'transaction_count': row[2],
+            'avg_transaction_usd': float(row[3])
+        } for row in results])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fx_rates/current')
+def get_current_fx_rates():
+    """Get current FX rates"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT ON (currency) 
+                   currency, rate_to_usd, timestamp
+            FROM fx_rates
+            ORDER BY currency, timestamp DESC
+        """)
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return jsonify([{
+            'currency': row[0],
+            'rate_to_usd': float(row[1]),
+            'timestamp': row[2].isoformat()
+        } for row in results])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fx_rates/trends')
+def get_fx_rate_trends():
+    """Get FX rate trends"""
+    hours = request.args.get('hours', 24, type=int)
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT currency, rate_to_usd, timestamp
+            FROM fx_rates
+            WHERE timestamp >= NOW() - INTERVAL '%s hours'
+            ORDER BY currency, timestamp
+        """, (hours,))
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return jsonify([{
+            'currency': row[0],
+            'rate_to_usd': float(row[1]),
+            'timestamp': row[2].isoformat()
+        } for row in results])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/stats/summary')
+def get_summary_stats():
+    """Get summary statistics"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 
+                COUNT(*) as total_transactions,
+                COALESCE(SUM(amount_usd), 0) as total_revenue_usd,
+                COALESCE(AVG(amount_usd), 0) as avg_transaction_usd,
+                COUNT(DISTINCT user_id) as unique_users,
+                COUNT(DISTINCT country) as unique_countries,
+                COUNT(DISTINCT currency) as unique_currencies
+            FROM processed_transactions
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'
+        """)
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'total_transactions': result[0],
+            'total_revenue_usd': float(result[1]),
+            'avg_transaction_usd': float(result[2]),
+            'unique_users': result[3],
+            'unique_countries': result[4],
+            'unique_currencies': result[5],
+            'period': '24_hours',
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000, debug=False)
+
+#---
+# run.sh (Startup script)
+#---
+#!/bin/bash
+
+echo "Starting Transaction Data Pipeline System..."
+
+# Build and start all services
+docker-compose up --build -d
+
+# Wait for services to be ready
+echo "Waiting for services to be ready..."
+sleep 30
+
+# Check service health
+echo "Checking service health..."
+curl -f http://localhost:5000/api/health || echo "API service not ready"
+curl -f http://localhost:8501 || echo "Dashboard not ready"
+
+echo "System started successfully!"
+echo ""
+echo "Access points:"
+echo "- Dashboard: http://localhost:8501"
+echo "- API: http://localhost:5000/api"
+echo "- Kafka UI: http://localhost:8080"
+echo "- PostgreSQL: localhost:5432"
+echo ""
+echo "API Endpoints:"
+echo "- GET /api/health"
+echo "- GET /api/revenue/24h"
+echo "- GET /api/revenue/by_country"
+echo "- GET /api/revenue/by_currency"
+echo "- GET /api/transactions/hourly"
+echo "- GET /api/users/top"
+echo "- GET /api/fx_rates/current"
+echo "- GET /api/fx_rates/trends"
+echo "- GET /api/stats/summary"
